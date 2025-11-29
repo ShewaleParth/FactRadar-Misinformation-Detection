@@ -9,20 +9,21 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from transformers import pipeline
 
-# ============================================================
-# LOAD ENV
-# ============================================================
+# ============================================
+# LOAD ENVIRONMENT
+# ============================================
 load_dotenv()
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 
 app = FastAPI()
 
-# ============================================================
-# LOAD NLI (FAST MODE)
-# ============================================================
+# ============================================
+# LOAD NLI MODEL (STABLE)
+# ============================================
 print("Loading MNLI model...")
 nli_model = pipeline(
     "zero-shot-classification",
@@ -32,42 +33,49 @@ nli_model = pipeline(
 print("MNLI ready.")
 
 
-# ============================================================
+# ============================================
 # INPUT MODEL
-# ============================================================
+# ============================================
 class InputData(BaseModel):
     url: str
 
 
-# ============================================================
+# ============================================
 # HELPERS
-# ============================================================
+# ============================================
 def clean_query(text):
     allowed = string.ascii_letters + string.digits + " -/"
-    return " ".join("".join(c for c in text if c in allowed).split()[:12])
+    cleaned = "".join(c for c in text if c in allowed)
+    return " ".join(cleaned.split()[:12])
 
 
 def extract_claim(text):
     return re.sub(r"\s+", " ", text.strip())[:300]
 
 
-# ============================================================
-# SERPAPI SEARCH
-# ============================================================
+# ============================================
+# SERPAPI SEARCH (REPLACES GOOGLE CSE)
+# ============================================
 def serpapi_search(query):
     url = "https://serpapi.com/search"
-    params = {"engine": "google", "q": query, "api_key": SERPAPI_KEY}
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": SERPAPI_KEY
+    }
+
     try:
         r = requests.get(url, params=params)
         data = r.json()
-
         results = []
+
         for item in data.get("organic_results", []):
             results.append({
                 "title": item.get("title", ""),
                 "link": item.get("link", ""),
                 "snippet": item.get("snippet", "")
             })
+
         return results
 
     except Exception as e:
@@ -75,66 +83,74 @@ def serpapi_search(query):
         return []
 
 
-# ============================================================
-# SCRAPING
-# ============================================================
+# ============================================
+# HYBRID SCRAPER
+# ============================================
 def extract_visible_text(html):
     try:
         soup = BeautifulSoup(html, "html.parser")
-        text = " ".join(p.text.strip() for p in soup.find_all("p"))
+        text = " ".join([p.text.strip() for p in soup.find_all("p")])
         return re.sub(r"\s+", " ", text)[:800]
     except:
         return ""
 
 
 def scrape_page(url):
-    print("SCRAPING:", url)
+    print("Scraping:", url)
 
+    # 1️⃣ ScrapeNinja (no key needed)
     try:
-        html = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"}).text
-        txt = extract_visible_text(html)
-        if len(txt) > 60:
-            return txt
-    except:
-        pass
-
-    try:
-        r = requests.post("https://scrapeninja.net/api/scrape", json={"url": url}, timeout=7)
+        r = requests.post("https://scrapeninja.net/api/scrape", json={"url": url})
         if r.status_code == 200:
             html = r.json().get("body", "")
-            return extract_visible_text(html)
+            if html:
+                return extract_visible_text(html)
     except:
         pass
 
-    return ""
+    # 2️⃣ ScraperAPI (optional)
+    if SCRAPER_API_KEY:
+        try:
+            r = requests.get(
+                f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}&render=true"
+            )
+            return extract_visible_text(r.text)
+        except:
+            pass
+
+    # 3️⃣ BeautifulSoup fallback
+    try:
+        html = requests.get(url, timeout=5).text
+        return extract_visible_text(html)
+    except:
+        return ""
 
 
-# ============================================================
-# EVIDENCE RETRIEVAL
-# ============================================================
+# ============================================
+# EVIDENCE PIPELINE
+# ============================================
 def retrieve_evidence(claim):
     cleaned = clean_query(claim)
 
-    strict = (
+    strict_query = (
         f"\"{cleaned}\" (site:cdc.gov OR site:who.int OR site:nih.gov "
         f"OR site:mayoclinic.org OR site:hopkinsmedicine.org OR site:yalemedicine.org)"
     )
 
-    items = serpapi_search(strict)
+    items = serpapi_search(strict_query)
 
     if not items:
-        fallback = cleaned + " medical research verified"
+        fallback = cleaned + " health science verified"
         items = serpapi_search(fallback)
 
     evidence = []
-
-    for it in items[:3]:
+    for it in items:
         title = it.get("title", "")
         link = it.get("link", "")
         snippet = it.get("snippet", "")
 
         scraped = scrape_page(link)
-        final_snippet = scraped[:600] if scraped.strip() else snippet
+        final_snippet = scraped if scraped.strip() else snippet
 
         evidence.append({
             "title": title,
@@ -145,15 +161,15 @@ def retrieve_evidence(claim):
     return evidence
 
 
-# ============================================================
-# NLI CLASSIFICATION
-# ============================================================
-def ml_nli_label(claim, evidence):
+# ============================================
+# NLI DECISION
+# ============================================
+def ml_nli_label(claim, evidence_list):
     support = 0.0
     contra = 0.0
 
-    for ev in evidence[:2]:
-        snippet = ev["snippet"][:300]
+    for ev in evidence_list:
+        snippet = ev["snippet"]
         if len(snippet) < 30:
             continue
 
@@ -179,21 +195,22 @@ def ml_nli_label(claim, evidence):
     return "UNCERTAIN"
 
 
-# ============================================================
-# GEMINI REASONING
-# ============================================================
+# ============================================
+# GEMINI
+# ============================================
 def gemini_reasoning(claim, evidence):
-    text = "\n".join(ev["snippet"][:350] for ev in evidence)
+    ev_text = "\n".join(ev["snippet"] for ev in evidence)
 
     prompt = f"""
-Scientific fact-check the following:
+Fact-check the claim using only scientific reasoning.
 
-CLAIM: {claim}
+CLAIM:
+{claim}
 
 EVIDENCE:
-{text if text else "NO EVIDENCE"}
+{ev_text if ev_text else "NO EVIDENCE"}
 
-Output one word:
+Respond with ONE WORD ONLY:
 REAL
 MISINFORMATION
 UNCERTAIN
@@ -204,60 +221,37 @@ UNCERTAIN
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": [{"parts": [{"text": prompt}]}]}
         )
-        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].upper()
+        raw = r.json()
+
+        try:
+            txt = raw["candidates"][0]["content"]["parts"][0]["text"].upper()
+        except:
+            txt = json.dumps(raw).upper()
 
         for w in ["REAL", "MISINFORMATION", "UNCERTAIN"]:
             if w in txt:
                 return w
+
     except:
         pass
 
     return "UNCERTAIN"
 
 
-# ============================================================
-# GEMINI SUMMARY GENERATOR
-# ============================================================
-def generate_summary(claim, evidence):
-    text = "\n".join(ev["snippet"][:400] for ev in evidence)
+# ============================================
+# LLAMA
+# ============================================
+def openrouter_reasoning(claim, evidence):
+    ev_text = "\n".join(ev["snippet"] for ev in evidence)
 
     prompt = f"""
-Summarize the scientific evidence in 3–5 sentences.
-
-CLAIM: {claim}
+CLAIM:
+{claim}
 
 EVIDENCE:
-{text if text else "NO EVIDENCE"}
+{ev_text if ev_text else "NO EVIDENCE"}
 
-Your summary must:
-- Be scientific and neutral
-- Explain what the evidence suggests
-- Avoid giving verdict labels
-"""
-
-    try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [{"text": prompt}]}]}
-        )
-
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except:
-        return "No summary available."
-
-
-# ============================================================
-# LLAMA (ONLY IF NEEDED)
-# ============================================================
-def llama_reasoning(claim, evidence):
-    text = "\n".join(ev["snippet"][:350] for ev in evidence)
-
-    prompt = f"""
-CLAIM: {claim}
-EVIDENCE:
-{text}
-
-One word:
+Return ONE WORD:
 REAL
 MISINFORMATION
 UNCERTAIN
@@ -272,23 +266,24 @@ UNCERTAIN
                 "messages": [{"role": "user", "content": prompt}]
             }
         )
+
         txt = r.json()["choices"][0]["message"]["content"].upper()
 
         for w in ["REAL", "MISINFORMATION", "UNCERTAIN"]:
             if w in txt:
                 return w
+
     except:
         pass
 
     return "UNCERTAIN"
 
 
-# ============================================================
-# ENSEMBLE DECISION
-# ============================================================
+# ============================================
+# ENSEMBLE
+# ============================================
 def ensemble(ml, gem, llama):
     votes = [ml, gem, llama]
-
     if votes.count("MISINFORMATION") >= 2:
         return "MISINFORMATION"
     if votes.count("REAL") >= 2:
@@ -296,9 +291,9 @@ def ensemble(ml, gem, llama):
     return "UNCERTAIN"
 
 
-# ============================================================
-# MAIN ENDPOINT
-# ============================================================
+# ============================================
+# ENDPOINT
+# ============================================
 @app.post("/detect")
 def detect(data: InputData):
 
@@ -307,16 +302,10 @@ def detect(data: InputData):
 
     ml = ml_nli_label(claim, evidence)
     gem = gemini_reasoning(claim, evidence)
-
-    if ml == gem:
-        llama = ml
-    else:
-        llama = llama_reasoning(claim, evidence)
+    llama = openrouter_reasoning(claim, evidence)
 
     final = ensemble(ml, gem, llama)
     trust = round((sum([ml == final, gem == final, llama == final]) / 3) * 100)
-
-    summary = generate_summary(claim, evidence)
 
     return {
         "claim": claim,
@@ -325,6 +314,5 @@ def detect(data: InputData):
         "openrouter_label": llama,
         "final_label": final,
         "trust_score": trust,
-        "evidence": evidence,
-        "summary": summary
+        "evidence": evidence
     }

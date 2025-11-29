@@ -12,31 +12,25 @@ from dotenv import load_dotenv
 from transformers import pipeline
 from concurrent.futures import ThreadPoolExecutor
 
-# ============================================================
-# LOAD ENV
-# ============================================================
+
 load_dotenv()
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# ============================================================
-# FASTAPI APP + CORS FIX  (Fixes OPTIONS 405)
-# ============================================================
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # or specific URL
+    allow_origins=["*"],          
     allow_credentials=True,
-    allow_methods=["*"],          # fixes OPTIONS preflight
+    allow_methods=["*"],          
     allow_headers=["*"],
 )
 
-# ============================================================
-# LOAD NLI MODEL (RUN SYNC USING EXECUTOR)
-# ============================================================
+
 print("Loading MNLI model...")
 nli_model = pipeline(
     "zero-shot-classification",
@@ -46,16 +40,10 @@ executor = ThreadPoolExecutor(max_workers=4)
 print("MNLI ready.")
 
 
-# ============================================================
-# INPUT MODEL
-# ============================================================
 class InputData(BaseModel):
     url: str
 
 
-# ============================================================
-# HELPERS
-# ============================================================
 def clean_query(text):
     allowed = string.ascii_letters + string.digits + " -/"
     return " ".join("".join(c for c in text if c in allowed).split()[:12])
@@ -65,9 +53,6 @@ def extract_claim(text):
     return re.sub(r"\s+", " ", text.strip())[:300]
 
 
-# ============================================================
-# ASYNC SERPAPI SEARCH
-# ============================================================
 async def serpapi_search(query):
     url = "https://serpapi.com/search"
     params = {"engine": "google", "q": query, "api_key": SERPAPI_KEY}
@@ -90,9 +75,7 @@ async def serpapi_search(query):
         return []
 
 
-# ============================================================
-# SCRAPING (ASYNC)
-# ============================================================
+
 def extract_visible_text(html):
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -136,9 +119,7 @@ async def scrape_page(url):
     return ""
 
 
-# ============================================================
-# EVIDENCE RETRIEVAL
-# ============================================================
+
 async def retrieve_evidence(claim):
     cleaned = clean_query(claim)
 
@@ -169,9 +150,7 @@ async def retrieve_evidence(claim):
     return evidence
 
 
-# ============================================================
-# ASYNC NLI MODEL EXECUTION (RUN IN EXECUTOR)
-# ============================================================
+
 async def ml_nli_label(claim, evidence):
     support = 0.0
     contra = 0.0
@@ -205,12 +184,9 @@ async def ml_nli_label(claim, evidence):
         return "MISINFORMATION"
     if support > contra and support > 0.5:
         return "REAL"
-    return "UNCERTAIN"
+    return "UN"
 
 
-# ============================================================
-# GEMINI (ASYNC)
-# ============================================================
 async def gemini_reasoning(claim, evidence):
 
     text = "\n".join(ev["snippet"][:350] for ev in evidence)
@@ -244,9 +220,7 @@ UNCERTAIN
     return "UNCERTAIN"
 
 
-# ============================================================
-# SUMMARY GENERATION
-# ============================================================
+
 async def generate_summary(claim, evidence):
     text = "\n".join(ev["snippet"][:400] for ev in evidence)
 
@@ -271,9 +245,6 @@ EVIDENCE:
         return "No summary available."
 
 
-# ============================================================
-# LLAMA REASONING
-# ============================================================
 async def llama_reasoning(claim, evidence):
 
     text = "\n".join(ev["snippet"][:350] for ev in evidence)
@@ -310,9 +281,6 @@ UNCERTAIN
     return "UNCERTAIN"
 
 
-# ============================================================
-# ENSEMBLE DECISION
-# ============================================================
 def ensemble(ml, gem, llama):
     votes = [ml, gem, llama]
 
@@ -323,9 +291,6 @@ def ensemble(ml, gem, llama):
     return "UNCERTAIN"
 
 
-# ============================================================
-# MAIN ENDPOINT
-# ============================================================
 @app.post("/detect")
 async def detect(data: InputData):
 
@@ -354,9 +319,7 @@ async def detect(data: InputData):
     }
 
 
-# ============================================================
-# UVICORN RUNNER
-# ============================================================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
